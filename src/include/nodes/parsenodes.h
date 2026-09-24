@@ -299,6 +299,7 @@ typedef struct TypeName
 	bool		pct_type;		/* %TYPE specified? */
 	bool		row_type;		/* %ROWTYPE specified? */
 	List	   *typmods;		/* type modifier expression(s) */
+	struct TypeName *refTypeName; /* target of Oracle REF target-type syntax */
 	int32		typemod;		/* prespecified type modifier */
 	List	   *arrayBounds;	/* array bounds */
 	ParseLoc	location;		/* token location, or -1 if unknown */

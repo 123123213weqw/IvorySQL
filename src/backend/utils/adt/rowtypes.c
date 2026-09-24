@@ -19,7 +19,9 @@
 
 #include "access/detoast.h"
 #include "access/htup_details.h"
+#include "access/relation.h"
 #include "catalog/pg_type.h"
+#include "catalog/namespace.h"
 #include "funcapi.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
@@ -40,6 +42,116 @@
 #include "commands/extension.h"
 #include "commands/packagecmds.h"
 #include "executor/spi.h"
+
+Datum ora_deref_internal(PG_FUNCTION_ARGS);
+
+/*
+ * DEREF returns the current value of the referenced object-table row, or
+ * NULL when the row/table no longer exists.  The value is a typed composite,
+ * not a copy cached in the REF datum.
+ */
+Datum
+ora_deref_internal(PG_FUNCTION_ARGS)
+{
+	HeapTupleHeader ref;
+	HeapTupleData tuple;
+	TupleDesc	desc;
+	Datum		tableDatum;
+	Datum		rowDatum;
+	Oid		targetType;
+	Oid		tableId;
+	int64		rowNo;
+	bool		isnull;
+	Relation	relation;
+	StringInfoData sql;
+	Oid		argtypes[1] = {INT8OID};
+	Datum		values[1];
+	int			spiResult;
+	Datum		result;
+	HeapTupleHeader output;
+	Size		outputSize;
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+	targetType = get_fn_expr_argtype(fcinfo->flinfo, 1);
+	if (!OidIsValid(targetType) || !get_typisobject(targetType))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("DEREF requires an Oracle object type")));
+
+	ref = PG_GETARG_HEAPTUPLEHEADER(0);
+	desc = lookup_rowtype_tupdesc(HeapTupleHeaderGetTypeId(ref),
+									 HeapTupleHeaderGetTypMod(ref));
+	if (desc->natts != 2 ||
+		TupleDescAttr(desc, 0)->atttypid != REGCLASSOID ||
+		TupleDescAttr(desc, 1)->atttypid != INT8OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("invalid object reference representation")));
+	tuple.t_len = HeapTupleHeaderGetDatumLength(ref);
+	tuple.t_data = ref;
+	tuple.t_tableOid = InvalidOid;
+	tableDatum = heap_getattr(&tuple, 1, desc, &isnull);
+	if (isnull)
+	{
+		ReleaseTupleDesc(desc);
+		PG_RETURN_NULL();
+	}
+	tableId = DatumGetObjectId(tableDatum);
+	rowDatum = heap_getattr(&tuple, 2, desc, &isnull);
+	if (isnull)
+	{
+		ReleaseTupleDesc(desc);
+		PG_RETURN_NULL();
+	}
+	rowNo = DatumGetInt64(rowDatum);
+	ReleaseTupleDesc(desc);
+
+	relation = try_relation_open(tableId, AccessShareLock);
+	if (relation == NULL)
+		PG_RETURN_NULL();
+	if (relation->rd_rel->reloftype != targetType ||
+		!relation->rd_rel->relhasrowid)
+	{
+		relation_close(relation, AccessShareLock);
+		PG_RETURN_NULL();
+	}
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT ROW(t.*)::%s FROM %s AS t "
+					 "WHERE (t.rowid).rowno = $1",
+					 format_type_be_qualified(targetType),
+					 quote_qualified_identifier(
+						 get_namespace_name(RelationGetNamespace(relation)),
+						 RelationGetRelationName(relation)));
+	values[0] = Int64GetDatum(rowNo);
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed while dereferencing object");
+	spiResult = SPI_execute_with_args(sql.data, 1, argtypes, values,
+									 NULL, true, 1);
+	if (spiResult != SPI_OK_SELECT)
+		elog(ERROR, "could not query object table while dereferencing");
+	if (SPI_processed == 0)
+	{
+		SPI_finish();
+		relation_close(relation, AccessShareLock);
+		PG_RETURN_NULL();
+	}
+	result = SPI_getbinval(SPI_tuptable->vals[0],
+						   SPI_tuptable->tupdesc, 1, &isnull);
+	if (isnull)
+	{
+		SPI_finish();
+		relation_close(relation, AccessShareLock);
+		PG_RETURN_NULL();
+	}
+	outputSize = VARSIZE_ANY(DatumGetPointer(result));
+	output = SPI_palloc(outputSize);
+	memcpy(output, DatumGetPointer(result), outputSize);
+	SPI_finish();
+	relation_close(relation, AccessShareLock);
+	PG_RETURN_HEAPTUPLEHEADER(output);
+}
 
 
 /*

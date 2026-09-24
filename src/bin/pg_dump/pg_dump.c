@@ -295,6 +295,7 @@ static void dumpDumpableObject(Archive *fout, DumpableObject *dobj);
 static void dumpNamespace(Archive *fout, const NamespaceInfo *nspinfo);
 static void dumpExtension(Archive *fout, const ExtensionInfo *extinfo);
 static void dumpType(Archive *fout, const TypeInfo *tyinfo);
+static bool hasOracleRefTypeCatalog(Archive *fout);
 static void dumpBaseType(Archive *fout, const TypeInfo *tyinfo);
 static void dumpEnumType(Archive *fout, const TypeInfo *tyinfo);
 static void dumpRangeType(Archive *fout, const TypeInfo *tyinfo);
@@ -2118,6 +2119,14 @@ selectDumpableTable(TableInfo *tbinfo, Archive *fout)
 static void
 selectDumpableType(TypeInfo *tyinfo, Archive *fout)
 {
+	/* CREATE TYPE AS OBJECT regenerates its private REF domain. */
+	if (OidIsValid(tyinfo->refBaseOid))
+	{
+		tyinfo->dobj.objType = DO_DUMMY_TYPE;
+		tyinfo->dobj.dump = DUMP_COMPONENT_NONE;
+		return;
+	}
+
 	/* skip complex types, except for standalone composite types */
 	if (OidIsValid(tyinfo->typrelid) &&
 		tyinfo->typrelkind != RELKIND_COMPOSITE_TYPE)
@@ -2555,8 +2564,15 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 	PGresult   *res;
 	int			nfields,
 				i;
-	int			rows_per_statement = dopt->dump_inserts;
+	int			rows_per_statement = tbinfo->relhasrowid ? 1 : dopt->dump_inserts;
 	int			rows_this_statement = 0;
+	PQExpBuffer rowidRelname = NULL;
+
+	if (tbinfo->relhasrowid)
+	{
+		rowidRelname = createPQExpBuffer();
+		appendStringLiteralAH(rowidRelname, fmtQualifiedDumpable(tbinfo), fout);
+	}
 
 	/* Temporary allows to access to foreign tables to dump data */
 	if (tbinfo->relkind == RELKIND_FOREIGN_TABLE)
@@ -2587,8 +2603,14 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 		attgenerated[nfields] = tbinfo->attgenerated[i];
 		nfields++;
 	}
+	if (tbinfo->relhasrowid)
+	{
+		if (nfields > 0)
+			appendPQExpBufferStr(q, ", ");
+		appendPQExpBufferStr(q, "(rowid).rowno AS __ivory_ref_rowno");
+	}
 	/* Servers before 9.4 will complain about zero-column SELECT */
-	if (nfields == 0)
+	if (nfields == 0 && !tbinfo->relhasrowid)
 		appendPQExpBufferStr(q, "NULL");
 	appendPQExpBuffer(q, " FROM ONLY %s",
 					  fmtQualifiedDumpable(tbinfo));
@@ -2603,7 +2625,7 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 							  PGRES_TUPLES_OK);
 
 		/* cross-check field count, allowing for dummy NULL if any */
-		if (nfields != PQnfields(res) &&
+		if (nfields + (tbinfo->relhasrowid ? 1 : 0) != PQnfields(res) &&
 			!(nfields == 0 && PQnfields(res) == 1))
 			pg_fatal("wrong number of fields retrieved from table \"%s\"",
 					 tbinfo->dobj.name);
@@ -2644,7 +2666,7 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 			else
 			{
 				/* append the list of column names if required */
-				if (dopt->column_inserts)
+				if (dopt->column_inserts || tbinfo->relhasrowid)
 				{
 					appendPQExpBufferChar(insertStmt, '(');
 					for (int field = 0; field < nfields; field++)
@@ -2666,6 +2688,10 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 
 		for (int tuple = 0; tuple < PQntuples(res); tuple++)
 		{
+			if (tbinfo->relhasrowid)
+				archprintf(fout,
+						   "SELECT sys.ora_set_next_rowid(%s::regclass, %s);\n",
+						   rowidRelname->data, PQgetvalue(res, tuple, nfields));
 			/* Write the INSERT if not in the middle of a multi-row INSERT. */
 			if (rows_this_statement == 0)
 				archputs(insertStmt->data, fout);
@@ -2800,6 +2826,8 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 	if (insertStmt != NULL)
 		destroyPQExpBuffer(insertStmt);
 	free(attgenerated);
+	if (rowidRelname != NULL)
+		destroyPQExpBuffer(rowidRelname);
 
 	/* Revert back the setting */
 	if (tbinfo->relkind == RELKIND_FOREIGN_TABLE)
@@ -2904,7 +2932,7 @@ dumpTableData(Archive *fout, const TableDataInfo *tdinfo)
 	else
 		copyFrom = fmtQualifiedDumpable(tbinfo);
 
-	if (dopt->dump_inserts == 0)
+	if (dopt->dump_inserts == 0 && !tbinfo->relhasrowid)
 	{
 		/* Dump/restore using COPY */
 		dumpFn = dumpTableData_copy;
@@ -6290,6 +6318,24 @@ cleanup:
 	return extinfo;
 }
 
+/* Probe the catalog, since a same-version PostgreSQL server lacks this field. */
+static bool
+hasOracleRefTypeCatalog(Archive *fout)
+{
+	static int	result = -1;
+	PGresult   *res;
+
+	if (result >= 0)
+		return result != 0;
+	res = ExecuteSqlQueryForSingleRow(fout,
+		"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
+		"WHERE attrelid = 'pg_catalog.pg_type'::pg_catalog.regclass "
+		"AND attname = 'typrefbase' AND NOT attisdropped)");
+	result = PQgetvalue(res, 0, 0)[0] == 't';
+	PQclear(res);
+	return result != 0;
+}
+
 /*
  * getTypes:
  *	  get information about all types in the system catalogs
@@ -6319,6 +6365,7 @@ getTypes(Archive *fout)
 	int			i_typtype;
 	int			i_typisdefined;
 	int			i_typisobject;
+	int			i_typrefbase;
 	int			i_isarray;
 	int			i_typarray;
 
@@ -6350,6 +6397,10 @@ getTypes(Archive *fout)
 		appendPQExpBufferStr(query, "typisobject, ");
 	else
 		appendPQExpBufferStr(query, "false AS typisobject, ");
+	if (hasOracleRefTypeCatalog(fout))
+		appendPQExpBufferStr(query, "typrefbase, ");
+	else
+		appendPQExpBufferStr(query, "0::oid AS typrefbase, ");
 
 	appendPQExpBufferStr(query,
 						 "typname[0] = '_' AND typelem != 0 AND "
@@ -6375,6 +6426,7 @@ getTypes(Archive *fout)
 	i_typtype = PQfnumber(res, "typtype");
 	i_typisdefined = PQfnumber(res, "typisdefined");
 	i_typisobject = PQfnumber(res, "typisobject");
+	i_typrefbase = PQfnumber(res, "typrefbase");
 	i_isarray = PQfnumber(res, "isarray");
 	i_typarray = PQfnumber(res, "typarray");
 
@@ -6399,6 +6451,7 @@ getTypes(Archive *fout)
 		tyinfo[i].typtype = *PQgetvalue(res, i, i_typtype);
 		tyinfo[i].isObject =
 			strcmp(PQgetvalue(res, i, i_typisobject), "t") == 0;
+		tyinfo[i].refBaseOid = atooid(PQgetvalue(res, i, i_typrefbase));
 		tyinfo[i].shellType = NULL;
 
 		if (strcmp(PQgetvalue(res, i, i_typisdefined), "t") == 0)
@@ -9594,8 +9647,18 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 						 "a.attisdropped,\n"
 						 "a.attlen,\n"
 						 "a.attalign,\n"
-						 "a.attislocal,\n"
-						 "pg_catalog.format_type(t.oid, a.atttypmod) AS atttypname,\n"
+						 "a.attislocal,\n");
+	if (hasOracleRefTypeCatalog(fout))
+		appendPQExpBufferStr(q,
+							 "CASE WHEN t.typrefbase <> 0 THEN "
+							 "'REF \"' || replace(refn.nspname, '\"', '\"\"') || "
+							 "'\".\"' || replace(reft.typname, '\"', '\"\"') || '\"' "
+							 "ELSE pg_catalog.format_type(t.oid, a.atttypmod) "
+							 "END AS atttypname,\n");
+	else
+		appendPQExpBufferStr(q,
+							 "pg_catalog.format_type(t.oid, a.atttypmod) AS atttypname,\n");
+	appendPQExpBufferStr(q,
 						 "array_to_string(a.attoptions, ', ') AS attoptions,\n"
 						 "CASE WHEN a.attcollation <> t.typcollation "
 						 "THEN a.attcollation ELSE 0 END AS attcollation,\n"
@@ -9706,6 +9769,10 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 					  "LEFT JOIN pg_catalog.pg_type t "
 					  "ON (a.atttypid = t.oid)\n",
 					  tbloids->data);
+	if (hasOracleRefTypeCatalog(fout))
+		appendPQExpBufferStr(q,
+							 "LEFT JOIN pg_catalog.pg_type reft ON reft.oid = t.typrefbase "
+							 "LEFT JOIN pg_catalog.pg_namespace refn ON refn.oid = reft.typnamespace\n");
 
 	/*
 	 * In versions 18 and up, we need pg_constraint for explicit NOT NULL
@@ -13414,16 +13481,30 @@ dumpCompositeType(Archive *fout, const TypeInfo *tyinfo)
 		 */
 		appendPQExpBufferStr(query,
 							 "PREPARE dumpCompositeType(pg_catalog.oid) AS\n"
-							 "SELECT a.attname, a.attnum, "
-							 "pg_catalog.format_type(a.atttypid, a.atttypmod) AS atttypdefn, "
+							 "SELECT a.attname, a.attnum, ");
+		if (hasOracleRefTypeCatalog(fout))
+			appendPQExpBufferStr(query,
+								 "CASE WHEN at.typrefbase <> 0 THEN "
+								 "'REF \"' || replace(refn.nspname, '\"', '\"\"') || "
+								 "'\".\"' || replace(reft.typname, '\"', '\"\"') || '\"' "
+								 "ELSE pg_catalog.format_type(a.atttypid, a.atttypmod) "
+								 "END AS atttypdefn, ");
+		else
+			appendPQExpBufferStr(query,
+								 "pg_catalog.format_type(a.atttypid, a.atttypmod) AS atttypdefn, ");
+		appendPQExpBufferStr(query,
 							 "a.attlen, a.attalign, a.attisdropped, "
 							 "CASE WHEN a.attcollation <> at.typcollation "
 							 "THEN a.attcollation ELSE 0 END AS attcollation "
 							 "FROM pg_catalog.pg_type ct "
 							 "JOIN pg_catalog.pg_attribute a ON a.attrelid = ct.typrelid "
-							 "LEFT JOIN pg_catalog.pg_type at ON at.oid = a.atttypid "
-							 "WHERE ct.oid = $1 "
-							 "ORDER BY a.attnum");
+							 "LEFT JOIN pg_catalog.pg_type at ON at.oid = a.atttypid ");
+		if (hasOracleRefTypeCatalog(fout))
+			appendPQExpBufferStr(query,
+								 "LEFT JOIN pg_catalog.pg_type reft ON reft.oid = at.typrefbase "
+								 "LEFT JOIN pg_catalog.pg_namespace refn ON refn.oid = reft.typnamespace ");
+		appendPQExpBufferStr(query,
+							 "WHERE ct.oid = $1 ORDER BY a.attnum");
 
 		ExecuteSqlStatement(fout, query->data);
 
@@ -21161,6 +21242,23 @@ getDependencies(Archive *fout)
 			pg_log_warning("no referenced object %u %u",
 						   refobjId.tableoid, refobjId.oid);
 #endif
+			continue;
+		}
+
+		/* A REF domain is regenerated by CREATE TYPE AS OBJECT. */
+		if (dobj->objType == DO_DUMMY_TYPE &&
+			OidIsValid(((TypeInfo *) dobj)->refBaseOid))
+			continue;
+		if (refdobj->objType == DO_DUMMY_TYPE &&
+			OidIsValid(((TypeInfo *) refdobj)->refBaseOid))
+		{
+			TypeInfo   *target = findTypeByOid(((TypeInfo *) refdobj)->refBaseOid);
+
+			/* The object type's own relation is created by that command too. */
+			if (target != NULL &&
+				!(dobj->objType == DO_TABLE &&
+				  ((TableInfo *) dobj)->reltype == target->dobj.catId.oid))
+				addObjectDependency(dobj, target->dobj.dumpId);
 			continue;
 		}
 

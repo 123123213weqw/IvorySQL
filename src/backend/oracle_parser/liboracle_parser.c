@@ -688,6 +688,9 @@ ora_base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, ora_core_yyscan_t yyscanner)
 		case TYPE_P:
 			cur_token_length = 4;
 			break;
+		case REF_P:
+			cur_token_length = 3;
+			break;
 		case MEMBER:
 			cur_token_length = 6;
 			break;
@@ -779,6 +782,12 @@ ora_base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, ora_core_yyscan_t yyscanner)
 			/* Replace TYPE by TYPE_BODY if it's followed by BODY. */
 			if (next_token == BODY)
 				cur_token = TYPE_BODY;
+			break;
+
+		case REF_P:
+			/* A REF declaration starts with a (possibly quoted) type name. */
+			if (next_token == IDENT)
+				cur_token = REF_LA;
 			break;
 
 		case MEMBER:

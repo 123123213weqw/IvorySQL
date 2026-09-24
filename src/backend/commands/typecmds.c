@@ -62,6 +62,7 @@
 #include "commands/tablecmds.h"
 #include "commands/typecmds.h"
 #include "executor/executor.h"
+#include "executor/spi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/optimizer.h"
@@ -2896,6 +2897,7 @@ DefineCompositeType(RangeVar *typevar, List *coldeflist, bool is_object,
 	CreateStmt *createStmt = makeNode(CreateStmt);
 	Oid			old_type_oid;
 	Oid			typeNamespace;
+	Oid			refDomainOid = InvalidOid;
 	ObjectAddress address;
 
 	if (is_object && coldeflist == NIL)
@@ -2932,7 +2934,81 @@ DefineCompositeType(RangeVar *typevar, List *coldeflist, bool is_object,
 						ObjectIdGetDatum(typeNamespace));
 	if (OidIsValid(old_type_oid))
 	{
-		if (is_object && replace)
+		if (!(is_object && replace) &&
+			!moveArrayTypeName(old_type_oid, createStmt->relation->relname, typeNamespace))
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("type \"%s\" already exists", createStmt->relation->relname)));
+	}
+	else if (is_object)
+		check_object_type_namespace_conflicts(typeNamespace,
+									  createStmt->relation->relname);
+
+	if (is_object)
+	{
+		ListCell   *lc;
+		char	   *domainName = get_object_ref_domain_name(typevar->relname);
+
+		if (OidIsValid(old_type_oid) && replace)
+			refDomainOid = get_object_ref_domain_oid(old_type_oid, false);
+		else
+		{
+			CreateDomainStmt *domain = makeNode(CreateDomainStmt);
+			char	   *schemaName = get_namespace_name(typeNamespace);
+			ObjectAddress domainAddress;
+			StringInfoData sql;
+			int			spiResult;
+
+			domain->domainname = list_make2(makeString(schemaName),
+										makeString(domainName));
+			domain->typeName = makeTypeNameFromNameList(list_make2(
+										makeString("sys"),
+										makeString("object_ref")));
+			domainAddress = DefineDomain(NULL, domain);
+			refDomainOid = domainAddress.objectId;
+			CommandCounterIncrement();
+
+			/* Add the check before the object type depends on this domain. */
+			initStringInfo(&sql);
+			appendStringInfo(&sql,
+						 "ALTER DOMAIN %s ADD CONSTRAINT ref_target "
+						 "CHECK (sys.object_ref_matches_domain(VALUE, %u::oid))",
+						 quote_qualified_identifier(schemaName, domainName),
+						 refDomainOid);
+			if (SPI_connect() != SPI_OK_CONNECT)
+				elog(ERROR, "SPI_connect failed while defining REF type");
+			spiResult = SPI_execute(sql.data, false, 0);
+			if (spiResult != SPI_OK_UTILITY)
+				elog(ERROR, "could not constrain REF type %u", refDomainOid);
+			SPI_finish();
+			CommandCounterIncrement();
+		}
+
+		foreach(lc, coldeflist)
+		{
+			ColumnDef  *column = lfirst_node(ColumnDef, lc);
+			TypeName   *refTarget = column->typeName->refTypeName;
+			Oid			columnRefOid;
+
+			if (refTarget == NULL)
+				continue;
+
+			if (list_length(refTarget->names) == 1 &&
+				strcmp(strVal(linitial(refTarget->names)), typevar->relname) == 0)
+				columnRefOid = refDomainOid;
+			else if (list_length(refTarget->names) == 2 &&
+				strcmp(strVal(linitial(refTarget->names)),
+					   get_namespace_name(typeNamespace)) == 0 &&
+				strcmp(strVal(lsecond(refTarget->names)), typevar->relname) == 0)
+				columnRefOid = refDomainOid;
+			else
+				columnRefOid = get_object_ref_domain_oid(
+					typenameTypeId(NULL, refTarget), false);
+
+			column->typeName = makeTypeNameFromOid(columnRefOid, -1);
+		}
+
+		if (OidIsValid(old_type_oid) && replace)
 		{
 			replace_object_type_attributes(old_type_oid, coldeflist);
 			ObjectAddressSet(address, TypeRelationId, old_type_oid);
@@ -2941,14 +3017,7 @@ DefineCompositeType(RangeVar *typevar, List *coldeflist, bool is_object,
 									instantiable, final);
 			return address;
 		}
-		if (!moveArrayTypeName(old_type_oid, createStmt->relation->relname, typeNamespace))
-			ereport(ERROR,
-					(errcode(ERRCODE_DUPLICATE_OBJECT),
-					 errmsg("type \"%s\" already exists", createStmt->relation->relname)));
 	}
-	else if (is_object)
-		check_object_type_namespace_conflicts(typeNamespace,
-									  createStmt->relation->relname);
 
 	/*
 	 * Finally create the relation.  This also creates the type.
@@ -2958,6 +3027,21 @@ DefineCompositeType(RangeVar *typevar, List *coldeflist, bool is_object,
 
 	if (is_object)
 	{
+		Relation	typrel;
+		HeapTuple	tup;
+		ObjectAddress refAddress;
+
+		typrel = table_open(TypeRelationId, RowExclusiveLock);
+		tup = SearchSysCacheCopy1(TYPEOID, ObjectIdGetDatum(refDomainOid));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for type %u", refDomainOid);
+		((Form_pg_type) GETSTRUCT(tup))->typrefbase = address.objectId;
+		CatalogTupleUpdate(typrel, &tup->t_self, tup);
+		heap_freetuple(tup);
+		table_close(typrel, RowExclusiveLock);
+
+		ObjectAddressSet(refAddress, TypeRelationId, refDomainOid);
+		recordDependencyOn(&refAddress, &address, DEPENDENCY_AUTO);
 		CommandCounterIncrement();
 		CreateObjectTypePackage(address.objectId, methods, false,
 								instantiable, final);

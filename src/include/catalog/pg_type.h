@@ -99,6 +99,9 @@ CATALOG(pg_type,1247,TypeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(71,TypeRelati
 	/* Was this composite type declared with Oracle AS OBJECT syntax? */
 	bool		typisobject BKI_DEFAULT(f);
 
+	/* Target object type for an internally generated Oracle REF domain. */
+	Oid			typrefbase BKI_DEFAULT(0) BKI_LOOKUP_OPT(pg_type);
+
 	/* delimiter for arrays of this type */
 	char		typdelim BKI_DEFAULT(',');
 

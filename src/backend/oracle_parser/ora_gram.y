@@ -448,7 +448,7 @@ static AlterTableCmd *makeModifyColumnTypeOrVisibilityCmd(char *colname,
 				stats_params
 				opt_include opt_c_include index_including_params
 				name_list role_list from_clause from_list opt_array_bounds
-				qualified_name_list any_name any_name_list type_name_list
+				qualified_name_list any_name any_name_list type_name_list RefTypeName
 				any_operator expr_list xmlf_expr_list attrs
 				distinct_clause opt_distinct_clause
 				target_list opt_target_list insert_column_list set_target_list
@@ -939,7 +939,7 @@ static AlterTableCmd *makeModifyColumnTypeOrVisibilityCmd(char *colname,
  * FORMAT_LA, NULLS_LA, WITH_LA, and WITHOUT_LA are needed to make the grammar
  * LALR(1).
  */
-%token		CONSTRUCTOR_LA FORMAT_LA MEMBER_LA NOT_LA NULLS_LA
+%token		CONSTRUCTOR_LA FORMAT_LA MEMBER_LA NOT_LA NULLS_LA REF_LA
 			STATIC_LA WITH_LA WITHOUT_LA PACKAGE_BODY TYPE_BODY
 
 /*
@@ -4481,6 +4481,26 @@ columnDef:	ColId Typename opt_column_storage opt_column_compression create_gener
 					n->location = @1;
 					$$ = (Node *) n;
 				}
+			| ColId REF_LA RefTypeName opt_column_storage opt_column_compression create_generic_options ColQualList column_invisible
+				{
+					ColumnDef *n = makeNode(ColumnDef);
+					TypeName *t = makeNode(TypeName);
+
+					t->refTypeName = makeTypeNameFromNameList($3);
+					t->location = @2;
+					n->colname = $1;
+					n->typeName = t;
+					n->storage_name = $4;
+					n->compression = $5;
+					n->is_local = true;
+					n->collOid = InvalidOid;
+					n->fdwoptions = $6;
+					SplitColQualList($7, &n->constraints, &n->collClause,
+									 yyscanner);
+					n->is_invisible = $8;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
 		;
 
 columnOptions:	ColId ColQualList column_invisible
@@ -7907,6 +7927,11 @@ object_type_name_on_any_name:
 any_name_list:
 			any_name								{ $$ = list_make1($1); }
 			| any_name_list ',' any_name			{ $$ = lappend($1, $3); }
+		;
+
+/* A REF target is an object type name, not a column-storage option. */
+RefTypeName: IDENT					{ $$ = list_make1(makeString($1)); }
+			| IDENT '.' IDENT			{ $$ = list_make2(makeString($1), makeString($3)); }
 		;
 
 any_name:	ColId						{ $$ = list_make1(makeString($1)); }
@@ -16673,6 +16698,20 @@ ObjectTypeElement:
 					n->collClause = (CollateClause *) $3;
 					n->collOid = InvalidOid;
 					n->constraints = NIL;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| ColId REF_LA RefTypeName
+				{
+					ColumnDef *n = makeNode(ColumnDef);
+					TypeName *t = makeNode(TypeName);
+
+					n->colname = $1;
+					t->refTypeName = makeTypeNameFromNameList($3);
+					t->location = @2;
+					n->typeName = t;
+					n->is_local = true;
+					n->collOid = InvalidOid;
 					n->location = @1;
 					$$ = (Node *) n;
 				}

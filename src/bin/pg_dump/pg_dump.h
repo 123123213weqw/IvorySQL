@@ -223,6 +223,7 @@ typedef struct _typeInfo
 	bool		isMultirange;	/* true if auto-generated multirange type */
 	bool		isDefined;		/* true if typisdefined */
 	bool		isObject;		/* true if declared with Oracle AS OBJECT */
+	Oid			refBaseOid;		/* target of an internally generated REF domain */
 	/* If needed, we'll create a "shell type" entry for it; link that here: */
 	struct _shellTypeInfo *shellType;	/* shell-type entry, or NULL */
 	/* If it's a domain, its not-null constraint is here: */

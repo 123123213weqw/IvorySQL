@@ -102,6 +102,7 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 	values[Anum_pg_type_typispreferred - 1] = BoolGetDatum(false);
 	values[Anum_pg_type_typisdefined - 1] = BoolGetDatum(false);
 	values[Anum_pg_type_typisobject - 1] = BoolGetDatum(false);
+	values[Anum_pg_type_typrefbase - 1] = ObjectIdGetDatum(InvalidOid);
 	values[Anum_pg_type_typdelim - 1] = CharGetDatum(DEFAULT_TYPDELIM);
 	values[Anum_pg_type_typrelid - 1] = ObjectIdGetDatum(InvalidOid);
 	values[Anum_pg_type_typsubscript - 1] = ObjectIdGetDatum(InvalidOid);
@@ -360,6 +361,7 @@ TypeCreate(Oid newTypeOid,
 	values[Anum_pg_type_typispreferred - 1] = BoolGetDatum(typePreferred);
 	values[Anum_pg_type_typisdefined - 1] = BoolGetDatum(true);
 	values[Anum_pg_type_typisobject - 1] = BoolGetDatum(isObject);
+	values[Anum_pg_type_typrefbase - 1] = ObjectIdGetDatum(InvalidOid);
 	values[Anum_pg_type_typdelim - 1] = CharGetDatum(typDelim);
 	values[Anum_pg_type_typrelid - 1] = ObjectIdGetDatum(relationOid);
 	values[Anum_pg_type_typsubscript - 1] = ObjectIdGetDatum(subscriptProcedure);
